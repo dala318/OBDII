@@ -19,6 +19,7 @@ class TransportBLE(TransportBase):
         uuid_write: str = MISSING,
         uuid_read: str = MISSING,
         timeout: float = 10.0,
+        loop: Optional[asyncio.AbstractEventLoop] = None, # Pass hass.loop here
         **kwargs,
     ) -> None:
         self.config: Dict[str, Any] = {
@@ -40,8 +41,9 @@ class TransportBLE(TransportBase):
         self._lock = Lock()
         self._data_ready = Event()
 
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop = loop
         self._thread: Optional[Thread] = None
+        self._managed_loop = False
 
     def __repr__(self) -> str:
         return f"<TransportBLE {self.config.get('address')}>"
@@ -73,29 +75,41 @@ class TransportBLE(TransportBase):
             raise RuntimeError("BLE connection is not established.")
         await self.ble_conn.write_gatt_char(self.config["uuid_write"], query)
 
-    def connect(self, **kwargs) -> None:
+    def connect(self, loop: Optional[asyncio.AbstractEventLoop] = None, **kwargs) -> None:
         self.config.update(kwargs)
 
-        self._loop = asyncio.new_event_loop()
-        self._thread = Thread(target=self._loop.run_forever, daemon=True)
-        self._thread.start()
+        if loop is not None:
+            self._loop = loop
+
+        # STANDALONE MODE: If no loop was passed, create one and a thread
+        if self._loop is None:
+            self._managed_loop = True
+            self._loop = asyncio.new_event_loop()
+            self._thread = Thread(target=self._loop.run_forever, daemon=True)
+            self._thread.start()
+        
         try:
             self._run_coro(self._connect())
         except Exception:
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            self._thread.join()
-            self._loop = None
-            self._thread = None
+            self.close() # Cleanup on failure
             raise
 
     def close(self) -> None:
-        if self._loop is None or self._thread is None:
-            return
-        self._run_coro(self._close())
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join()
-        self._loop = None
-        self._thread = None
+        if self.is_connected():
+            try:
+                self._run_coro(self._close())
+            except Exception:
+                pass # Already disconnecting or loop is dead
+
+        # STANDALONE MODE: Stop and join the loop and thread
+        if self._managed_loop:
+            if self._loop and self._loop.is_running():
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            if self._thread and self._thread.is_alive():
+                self._thread.join(timeout=2.0)            
+            self._loop = None
+            self._thread = None
+            self._managed_loop = False
 
     def is_connected(self) -> bool:
         if self.ble_conn is None:
@@ -119,7 +133,6 @@ class TransportBLE(TransportBase):
             if remaining <= 0:
                 raise TimeoutError("read timed out.")
 
-            self._data_ready.clear()
             with self._lock:
                 snapshot = bytes(self._buffer)
 
@@ -129,5 +142,6 @@ class TransportBLE(TransportBase):
                 break
 
             self._data_ready.wait(timeout=remaining)
+            self._data_ready.clear()
 
         return snapshot
